@@ -584,33 +584,31 @@ rs.Heartbeat:Connect(function()
 end)
 
 -- ── auto ammo ─────────────────────────────────────────────────
+-- Only blocks during non-armor purchases (guns are unequipped during those)
+-- Armor buys don't unequip guns so ammo can still be bought in parallel
 local lastAutoAmmo = 0
 rs.Heartbeat:Connect(function()
-	-- don't buy ammo while guns are unequipped for a shop buy, or while reloading
-	if killed or myKnocked or purchasing or local_reloading then return end
+	if killed or myKnocked or local_reloading then return end
+	-- Block if a gun buy is in progress (purchasing=true AND not just armor)
+	if purchasing and not armorPurchasing then return end
 	if tick() - lastAutoAmmo < 1.5 then return end
 	if not inventory then return end
 	lastAutoAmmo = tick()
 	for h, data in pairs(local_guns) do
 		local gun = h.Parent
-		-- CRITICAL: only buy ammo for guns currently in the CHARACTER, not backpack
-		-- buying ammo while gun is in backpack causes the loop to stall
-		if not gun then
-			local_guns[h] = nil  -- clean dead handle
-			continue
-		end
+		if not gun then local_guns[h] = nil; continue end
 		local char = plr.Character
-		if not char or gun.Parent ~= char then continue end  -- must be equipped
+		if not char or gun.Parent ~= char then continue end
 		local maxAmmoObj = gun:FindFirstChild("MaxAmmo")
 		if not maxAmmoObj then continue end
 		local invSlot = inventory:FindFirstChild(gun.Name)
 		if not invSlot then continue end
 		local clips = math.floor(tonumber(invSlot.Value) / math.max(maxAmmoObj.Value, 1))
-		if clips < 1 then
+		if clips < 2 then  -- buy when under 2 clips, not just 0 — stay stocked
 			local ammoKey = gun.Name:sub(2, -2):lower() .. " ammo"
 			if shops[ammoKey] and local_cash >= shops[ammoKey][2] then
 				buy(ammoKey, 10)
-				return  -- buy one gun's ammo at a time
+				return
 			end
 		end
 	end
@@ -645,33 +643,32 @@ local function doLoadout()
 	if loadoutBusy then return end
 	loadoutBusy = true
 	task.spawn(function()
-		-- Wait for cash to load before attempting any purchases
-		-- local_cash starts at 0 and only updates after DataFolder/Currency resolves
+		-- Wait for cash to load — 0.5s intervals, 30s max
 		if local_cash <= 0 then
 			local waited = 0
-			repeat task.wait(1); waited += 1 until local_cash > 0 or waited >= 60
+			repeat task.wait(0.5); waited += 0.5 until local_cash > 0 or waited >= 30
 		end
 		if local_cash <= 0 then
-			print("[loadout] cash still 0 after 60s — giving up")
+			print("[loadout] cash still 0 after 30s — giving up")
 			loadoutBusy = false
 			return
 		end
-		print("[loadout] cash loaded: $" .. local_cash .. " — starting")
+
 		for _, entry in ipairs(LOADOUT_GUNS) do
 			if killed then break end
 
-			-- buy if missing — wait for purchasing to clear before continuing
+			-- buy gun if missing
 			if not hasLoadoutGun(entry.nameMatch) then
 				if shops[entry.shopKey] and local_cash >= shops[entry.shopKey][2] then
 					print("[loadout] buying " .. entry.shopKey)
 					buy(entry.shopKey)
-					-- wait for the buy to fully complete
+					-- wait for buy + appearance, 8s max
 					local t = 0
 					repeat task.wait(0.1); t += 0.1
-					until (not purchasing and hasLoadoutGun(entry.nameMatch)) or t > 10
+					until (not purchasing and hasLoadoutGun(entry.nameMatch)) or t > 8
 				else
 					print("[loadout] skip " .. entry.shopKey .. " — need $" ..
-						(shops[entry.shopKey] and shops[entry.shopKey][2] or "?") ..
+						tostring(shops[entry.shopKey] and shops[entry.shopKey][2] or "?") ..
 						" have $" .. local_cash)
 				end
 			end
@@ -680,35 +677,28 @@ local function doLoadout()
 			local gun = findLoadoutGun(entry.nameMatch)
 			if gun and gun.Parent == plr.Backpack then
 				equipGun(gun)
-				task.wait(0.3)
+				task.wait(0.2)
 			end
 
-			-- buy ammo if low — wait for the buy to fully complete
+			-- buy ammo if low (0 clips)
 			gun = findLoadoutGun(entry.nameMatch)
 			if gun and inventory then
 				local maxAmmoObj = gun:FindFirstChild("MaxAmmo")
 				local invSlot    = inventory:FindFirstChild(gun.Name)
+				local needsAmmo  = false
 				if maxAmmoObj and invSlot then
-					local clips = math.floor(tonumber(invSlot.Value) / math.max(maxAmmoObj.Value, 1))
-					if clips < 1 then
-						local ammoKey = gun.Name:sub(2, -2):lower() .. " ammo"
-						if shops[ammoKey] and local_cash >= shops[ammoKey][2] then
-							print("[loadout] buying ammo: " .. ammoKey)
-							buy(ammoKey, entry.ammoClips)
-							local t = 0
-							repeat task.wait(0.1); t += 0.1 until not purchasing or t > 15
-						end
-					end
+					needsAmmo = math.floor(tonumber(invSlot.Value) / math.max(maxAmmoObj.Value, 1)) < 1
 				else
 					local ammo = gun:FindFirstChild("Ammo")
-					if ammo and ammo.Value < 5 then
-						local ammoKey = gun.Name:sub(2, -2):lower() .. " ammo"
-						if shops[ammoKey] and local_cash >= shops[ammoKey][2] then
-							print("[loadout] buying ammo (fallback): " .. ammoKey)
-							buy(ammoKey, entry.ammoClips)
-							local t = 0
-							repeat task.wait(0.1); t += 0.1 until not purchasing or t > 15
-						end
+					needsAmmo = ammo and ammo.Value < 3
+				end
+				if needsAmmo then
+					local ammoKey = gun.Name:sub(2, -2):lower() .. " ammo"
+					if shops[ammoKey] and local_cash >= shops[ammoKey][2] then
+						print("[loadout] buying ammo: " .. ammoKey)
+						buy(ammoKey, entry.ammoClips)
+						local t = 0
+						repeat task.wait(0.1); t += 0.1 until not purchasing or t > 12
 					end
 				end
 			end
@@ -738,11 +728,12 @@ end)
 
 task.spawn(function()
 	while not killed do
-		task.wait(5)
+		task.wait(2)
 		if not purchasing and local_cash > 0 then
-			-- check if any loadout gun is missing and rerun
 			for _, entry in ipairs(LOADOUT_GUNS) do
 				if not hasLoadoutGun(entry.nameMatch) then
+					-- Force reset loadoutBusy if a gun is missing — don't get stuck
+					loadoutBusy = false
 					task.spawn(doLoadout)
 					break
 				end
