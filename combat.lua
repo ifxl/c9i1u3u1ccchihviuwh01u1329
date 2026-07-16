@@ -505,15 +505,10 @@ local function doBuy(name, count, isArmor)
 end
 
 local function buy(name, count)
+	if purchasing then return end  -- never stack buys
 	local isArmor = name:find("armor") ~= nil
-	if purchasing then
-		if not isArmor then return end
-		if shops[name] and shops[name][6] and shops[name][6]:find("armor") then return end
-		purchasing = false
-	end
 	purchasing = true
 	task.spawn(function()
-		-- safety: if doBuy hangs for any reason, force reset after 10s
 		local done = false
 		task.delay(60, function() if not done then purchasing = false end end)
 		pcall(function() doBuy(name, count or 1, isArmor) end)
@@ -523,8 +518,7 @@ local function buy(name, count)
 end
 
 local function buyArmor()
-	if purchasing and shops["high-medium armor"] and shops["high-medium armor"][6]
-	   and shops["high-medium armor"][6]:find("armor") then return end
+	if purchasing then return end
 	purchasing = true
 	task.spawn(function()
 		local done = false
@@ -643,51 +637,55 @@ local function doLoadout()
 	task.spawn(function()
 		for _, entry in ipairs(LOADOUT_GUNS) do
 			if killed then break end
-			-- buy if missing
+
+			-- buy if missing — wait for purchasing to clear before continuing
 			if not hasLoadoutGun(entry.nameMatch) then
 				if shops[entry.shopKey] and local_cash >= shops[entry.shopKey][2] then
 					print("[loadout] buying " .. entry.shopKey)
 					buy(entry.shopKey)
-					-- wait for it to appear
+					-- wait for the buy to fully complete
 					local t = 0
 					repeat task.wait(0.1); t += 0.1
-					until hasLoadoutGun(entry.nameMatch) or t > 5
+					until (not purchasing and hasLoadoutGun(entry.nameMatch)) or t > 10
 				else
 					print("[loadout] skip " .. entry.shopKey .. " — need $" ..
 						(shops[entry.shopKey] and shops[entry.shopKey][2] or "?") ..
 						" have $" .. local_cash)
 				end
 			end
-			-- equip using setscriptable (hello.lua method — won't grab phone/cash)
+
+			-- equip if in backpack
 			local gun = findLoadoutGun(entry.nameMatch)
 			if gun and gun.Parent == plr.Backpack then
 				equipGun(gun)
-				task.wait(0.2)
+				task.wait(0.3)
 			end
-			-- buy ammo if clips < 1
+
+			-- buy ammo if low — wait for the buy to fully complete
 			gun = findLoadoutGun(entry.nameMatch)
 			if gun and inventory then
 				local maxAmmoObj = gun:FindFirstChild("MaxAmmo")
 				local invSlot    = inventory:FindFirstChild(gun.Name)
 				if maxAmmoObj and invSlot then
-					local clips = math.floor(tonumber(invSlot.Value) / maxAmmoObj.Value)
+					local clips = math.floor(tonumber(invSlot.Value) / math.max(maxAmmoObj.Value, 1))
 					if clips < 1 then
 						local ammoKey = gun.Name:sub(2, -2):lower() .. " ammo"
 						if shops[ammoKey] and local_cash >= shops[ammoKey][2] then
 							print("[loadout] buying ammo: " .. ammoKey)
 							buy(ammoKey, entry.ammoClips)
-							task.wait(1)
+							local t = 0
+							repeat task.wait(0.1); t += 0.1 until not purchasing or t > 15
 						end
 					end
 				else
-					-- fallback: client Ammo value
 					local ammo = gun:FindFirstChild("Ammo")
 					if ammo and ammo.Value < 5 then
 						local ammoKey = gun.Name:sub(2, -2):lower() .. " ammo"
 						if shops[ammoKey] and local_cash >= shops[ammoKey][2] then
 							print("[loadout] buying ammo (fallback): " .. ammoKey)
 							buy(ammoKey, entry.ammoClips)
-							task.wait(1)
+							local t = 0
+							repeat task.wait(0.1); t += 0.1 until not purchasing or t > 15
 						end
 					end
 				end
@@ -697,16 +695,21 @@ local function doLoadout()
 	end)
 end
 
--- auto-equip heartbeat: keep all loadout guns in character while targeting
--- uses setscriptable (hello.lua method) — guaranteed to only grab the right tool
+-- auto-equip heartbeat: keep loadout guns equipped while targeting
+-- throttled — only checks once per second to avoid spamming EquipTool every frame
+local lastEquipCheck = 0
 rs.Heartbeat:Connect(function()
 	if killed or myKnocked or purchasing then return end
 	if not targetPlayer then return end
+	local now = tick()
+	if now - lastEquipCheck < 1 then return end
+	lastEquipCheck = now
 	local char = plr.Character; if not char then return end
 	for _, entry in ipairs(LOADOUT_GUNS) do
 		local gun = findLoadoutGun(entry.nameMatch)
 		if gun and gun.Parent == plr.Backpack then
 			equipGun(gun)
+			break  -- equip one at a time per check
 		end
 	end
 end)
@@ -946,19 +949,35 @@ task.spawn(function()
 		local fDir   = (mag <= 0 or mag ~= mag) and Vector3.new(0, 0, -1) or dir.Unit
 		local hitPart = head or torso
 
-		-- build ordered list: only fire the currently equipped gun
-		-- firing multiple handles in one tick triggers "tool error: using multiple guns"
+		-- Find the single currently equipped gun to fire.
+		-- ONLY fire the tool that is actually in Character right now.
+		-- Never fire multiple handles — that's what causes the tool error kick.
+		-- Priority: rifle/flintlock first (highest DPS), then any other equipped gun.
 		local equippedHandle = nil
 		local equippedData   = nil
-		-- prefer equipped rifle, then any equipped gun
-		for h, data in pairs(local_guns) do
-			local g = h.Parent; if not g then continue end
-			if g.Parent ~= plr.Character then continue end
-			if g.Name == "[Rifle]" or g.Name == "[Flintlock]" then
-				equippedHandle = h; equippedData = data; break
+		local char = plr.Character
+		if char then
+			-- first pass: look for rifle/flintlock specifically
+			for h, data in pairs(local_guns) do
+				local g = h.Parent
+				if g and g.Parent == char then
+					if g.Name == "[Rifle]" or g.Name == "[Flintlock]" then
+						equippedHandle = h
+						equippedData   = data
+						break
+					end
+				end
 			end
+			-- second pass: any other gun in character (not backpack)
 			if not equippedHandle then
-				equippedHandle = h; equippedData = data
+				for h, data in pairs(local_guns) do
+					local g = h.Parent
+					if g and g.Parent == char then
+						equippedHandle = h
+						equippedData   = data
+						break
+					end
+				end
 			end
 		end
 
