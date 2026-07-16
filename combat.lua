@@ -179,25 +179,32 @@ rs.Heartbeat:Connect(function()
 end)
 
 -- ── cash + inventory — DataFolder ────────────────────────────
--- local_bought_count increments when cash decreases (hello.lua line 25702)
--- inventory used for auto ammo clip counting (hello.lua: inventory[gun.Name].Value)
 local inventory = nil
-task.spawn(function()
-	local df  = plr:WaitForChild("DataFolder", 10)
-	if not df then return end
-	local cur = df:WaitForChild("Currency", 10)
-	if not cur then return end
-	local_cash = cur.Value
-	cur:GetPropertyChangedSignal("Value"):Connect(function()
-		local new_cash = cur.Value
-		if new_cash < local_cash then
-			local_bought_count += 1
+local function hookDataFolder(char_or_plr)
+	task.spawn(function()
+		-- Try both player-level and character-level DataFolder (Da Hood uses player-level)
+		local df = plr:FindFirstChild("DataFolder")
+		if not df then
+			df = plr:WaitForChild("DataFolder", 30)
 		end
-		local_cash = new_cash
+		if not df then print("[cash] DataFolder not found after 30s"); return end
+		local cur = df:FindFirstChild("Currency") or df:WaitForChild("Currency", 10)
+		if not cur then print("[cash] Currency not found"); return end
+		local_cash = cur.Value
+		print("[cash] loaded: $" .. local_cash)
+		cur:GetPropertyChangedSignal("Value"):Connect(function()
+			local new_cash = cur.Value
+			if new_cash < local_cash then
+				local_bought_count += 1
+			end
+			local_cash = new_cash
+		end)
+		inventory = df:FindFirstChild("Inventory") or df:WaitForChild("Inventory", 10)
 	end)
-	-- inventory folder: hello.lua uses inventory[gun.Name].Value for ammo counts
-	inventory = df:FindFirstChild("Inventory") or df:WaitForChild("Inventory", 10)
-end)
+end
+hookDataFolder()
+-- Re-hook on respawn in case DataFolder resets
+plr.CharacterAdded:Connect(hookDataFolder)
 
 -- ── armor — BodyEffects.Armor ─────────────────────────────────
 local function hookArmor(char)
@@ -642,13 +649,14 @@ local function doLoadout()
 		-- local_cash starts at 0 and only updates after DataFolder/Currency resolves
 		if local_cash <= 0 then
 			local waited = 0
-			repeat task.wait(0.5); waited += 0.5 until local_cash > 0 or waited >= 20
+			repeat task.wait(1); waited += 1 until local_cash > 0 or waited >= 60
 		end
 		if local_cash <= 0 then
-			print("[loadout] cash still 0 after 20s — skipping")
+			print("[loadout] cash still 0 after 60s — giving up")
 			loadoutBusy = false
 			return
 		end
+		print("[loadout] cash loaded: $" .. local_cash .. " — starting")
 		for _, entry in ipairs(LOADOUT_GUNS) do
 			if killed then break end
 
