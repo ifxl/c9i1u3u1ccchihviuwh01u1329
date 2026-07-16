@@ -519,25 +519,28 @@ end
 
 local function buyArmor()
 	if purchasing then return end
+	if armorPurchasing then return end
+	armorPurchasing = true
 	purchasing = true
 	task.spawn(function()
 		local done = false
-		task.delay(60, function() if not done then purchasing = false end end)
+		task.delay(60, function() if not done then armorPurchasing = false; purchasing = false end end)
 		pcall(function() doBuy("high-medium armor", 1, true) end)
 		done = true
+		armorPurchasing = false
 		purchasing = false
 	end)
 end
 
 -- ── auto armor ────────────────────────────────────────────────
--- hello.lua: threshold = 130 * (pct/100), default was 40% (52)
--- Set to 90% (117) so it tops up immediately after taking any hit
 local lastArmor = 0
+local armorPurchasing = false  -- separate flag so armor buys never block each other
 rs.Heartbeat:Connect(function()
 	if killed or myKnocked then return end
-	if purchasing and shops["high-medium armor"] and shops["high-medium armor"][6]:find("armor") then return end
+	if armorPurchasing then return end  -- armor already in progress
+	if purchasing then return end       -- something else buying (guns unequipped etc)
 	if tick() - lastArmor < 0.05 then return end
-	if local_armor < 117 and local_cash > 5000 then  -- 117 = 90% of 130 max
+	if local_armor < 117 and local_cash > 5000 then
 		lastArmor = tick()
 		buyArmor()
 	end
