@@ -635,6 +635,17 @@ local function doLoadout()
 	if loadoutBusy then return end
 	loadoutBusy = true
 	task.spawn(function()
+		-- Wait for cash to load before attempting any purchases
+		-- local_cash starts at 0 and only updates after DataFolder/Currency resolves
+		if local_cash <= 0 then
+			local waited = 0
+			repeat task.wait(0.5); waited += 0.5 until local_cash > 0 or waited >= 20
+		end
+		if local_cash <= 0 then
+			print("[loadout] cash still 0 after 20s — skipping")
+			loadoutBusy = false
+			return
+		end
 		for _, entry in ipairs(LOADOUT_GUNS) do
 			if killed then break end
 
@@ -717,7 +728,7 @@ end)
 task.spawn(function()
 	while not killed do
 		task.wait(5)
-		if not purchasing then
+		if not purchasing and local_cash > 0 then
 			-- check if any loadout gun is missing and rerun
 			for _, entry in ipairs(LOADOUT_GUNS) do
 				if not hasLoadoutGun(entry.nameMatch) then
@@ -1926,7 +1937,7 @@ task.spawn(function()
 
 	-- known Da Hood promo codes (add new ones here)
 	local CODES = {
-		"FOURTH26",
+		"WORLDCUP26",
 		"BOSS",
 		"BALLON",
 		"FREECASH",
