@@ -998,9 +998,12 @@ end)
 
 -- ── STRAFE LOOP ───────────────────────────────────────────────
 -- Figure-8 pattern (harder to predict than simple circle)
--- Pauses during stomping and evasion
+-- Pauses during stomping, evasion, and buying
+-- purchasing MUST pause strafe — doBuy teleports HRP to the shop,
+-- and if strafe runs on the same frame it immediately overwrites that
+-- position and the click detector never fires at the right spot.
 rs.Heartbeat:Connect(function(dt)
-	if killed or myKnocked or stomping or in_void then return end
+	if killed or myKnocked or stomping or in_void or purchasing then return end
 	if not targetPlayer then return end
 	local myHrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
 	if not myHrp then return end
