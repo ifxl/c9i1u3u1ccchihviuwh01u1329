@@ -155,6 +155,16 @@ local killed          = false
 local targetPlayer    = nil
 local strafeAngle     = 0
 local strafeT         = 0
+
+-- setter: always clear velocity history when switching targets so aim
+-- doesn't lead in the wrong direction for the first few shots
+local function setTarget(p)
+	targetPlayer = p
+	-- headHistory is declared later but is upvalue-captured; clear it if it exists
+	if type(headHistory) == "table" then
+		for i = #headHistory, 1, -1 do headHistory[i] = nil end
+	end
+end
 local myKnocked       = false
 local local_cash      = 0
 local local_armor     = 0
@@ -172,10 +182,26 @@ local purchasing         = false  -- true while any buy is in progress (blocks a
 
 -- ── server position tracker ───────────────────────────────────
 -- Only updates when NOT evading so the shoot loop uses real server origin
-rs.Heartbeat:Connect(function()
-	local c = plr.Character
-	local h = c and c:FindFirstChild("HumanoidRootPart")
-	if h and not in_void then serverCFrame = h.CFrame end
+-- IMPORTANT: Disconnect old connection on respawn to prevent Heartbeat leaks
+local serverCFrameConnection = nil
+local function hookServerCFrame()
+	-- Disconnect old connection if any
+	if serverCFrameConnection then
+		pcall(function() serverCFrameConnection:Disconnect() end)
+		serverCFrameConnection = nil
+	end
+	-- Create new connection
+	serverCFrameConnection = rs.Heartbeat:Connect(function()
+		local c = plr.Character
+		local h = c and c:FindFirstChild("HumanoidRootPart")
+		if h and not in_void then serverCFrame = h.CFrame end
+	end)
+end
+
+hookServerCFrame()
+plr.CharacterAdded:Connect(function()
+	task.wait(0.1)
+	hookServerCFrame()
 end)
 
 -- ── cash + inventory — DataFolder ────────────────────────────
@@ -192,6 +218,21 @@ local function hookDataFolder(char_or_plr)
 		if not cur then print("[cash] Currency not found"); return end
 		local_cash = cur.Value
 		print("[cash] loaded: $" .. local_cash)
+		-- Early return if currency is still 0 (hasn't synced yet)
+		if local_cash == 0 then
+			print("[cash] WARNING: currency loaded as 0, waiting for sync...")
+			-- Wait up to 10s for it to become non-zero
+			local waited = 0
+			repeat 
+				task.wait(0.5)
+				waited += 0.5
+				if cur.Value > 0 then
+					local_cash = cur.Value
+					print("[cash] synced to: $" .. local_cash)
+					break
+				end
+			until waited >= 10
+		end
 		cur:GetPropertyChangedSignal("Value"):Connect(function()
 			local new_cash = cur.Value
 			if new_cash < local_cash then
@@ -524,9 +565,11 @@ local function buy(name, count)
 	end)
 end
 
+-- declared before buyArmor so the closure captures the real variable, not nil
+local armorPurchasing = false
+
 local function buyArmor()
-	if purchasing then return end
-	if armorPurchasing then return end
+	if armorPurchasing then return end  -- check first, no purchasing gate needed (armor doesn't unequip guns)
 	armorPurchasing = true
 	purchasing = true
 	task.spawn(function()
@@ -541,11 +584,10 @@ end
 
 -- ── auto armor ────────────────────────────────────────────────
 local lastArmor = 0
-local armorPurchasing = false  -- separate flag so armor buys never block each other
 rs.Heartbeat:Connect(function()
 	if killed or myKnocked then return end
-	if armorPurchasing then return end  -- armor already in progress
-	if purchasing then return end       -- something else buying (guns unequipped etc)
+	if armorPurchasing then return end
+	if purchasing then return end
 	if tick() - lastArmor < 0.05 then return end
 	if local_armor < 117 and local_cash > 5000 then
 		lastArmor = tick()
@@ -639,71 +681,89 @@ local function hasLoadoutGun(nameMatch)
 end
 
 local loadoutBusy = false
+local loadoutDeadlineTime = 0  -- Track when loadout started to prevent permanent hangs
+
 local function doLoadout()
 	if loadoutBusy then return end
 	loadoutBusy = true
+	loadoutDeadlineTime = tick() + 35  -- 35s max (was 30s + 5s buffer)
+	
 	task.spawn(function()
-		-- Wait for cash to load — 0.5s intervals, 30s max
-		if local_cash <= 0 then
-			local waited = 0
-			repeat task.wait(0.5); waited += 0.5 until local_cash > 0 or waited >= 30
-		end
-		if local_cash <= 0 then
-			print("[loadout] cash still 0 after 30s — giving up")
-			loadoutBusy = false
-			return
-		end
-
-		for _, entry in ipairs(LOADOUT_GUNS) do
-			if killed then break end
-
-			-- buy gun if missing
-			if not hasLoadoutGun(entry.nameMatch) then
-				if shops[entry.shopKey] and local_cash >= shops[entry.shopKey][2] then
-					print("[loadout] buying " .. entry.shopKey)
-					buy(entry.shopKey)
-					-- wait for buy + appearance, 8s max
-					local t = 0
-					repeat task.wait(0.1); t += 0.1
-					until (not purchasing and hasLoadoutGun(entry.nameMatch)) or t > 8
-				else
-					print("[loadout] skip " .. entry.shopKey .. " — need $" ..
-						tostring(shops[entry.shopKey] and shops[entry.shopKey][2] or "?") ..
-						" have $" .. local_cash)
-				end
+		local ok, err = pcall(function()
+			-- Wait for cash to load — 0.5s intervals, 30s max
+			if local_cash <= 0 then
+				local waited = 0
+				repeat task.wait(0.5); waited += 0.5 until local_cash > 0 or waited >= 30
+			end
+			if local_cash <= 0 then
+				print("[loadout] cash still 0 after 30s — giving up")
+				return
 			end
 
-			-- equip if in backpack
-			local gun = findLoadoutGun(entry.nameMatch)
-			if gun and gun.Parent == plr.Backpack then
-				equipGun(gun)
-				task.wait(0.2)
-			end
-
-			-- buy ammo if low (0 clips)
-			gun = findLoadoutGun(entry.nameMatch)
-			if gun and inventory then
-				local maxAmmoObj = gun:FindFirstChild("MaxAmmo")
-				local invSlot    = inventory:FindFirstChild(gun.Name)
-				local needsAmmo  = false
-				if maxAmmoObj and invSlot then
-					needsAmmo = math.floor(tonumber(invSlot.Value) / math.max(maxAmmoObj.Value, 1)) < 1
-				else
-					local ammo = gun:FindFirstChild("Ammo")
-					needsAmmo = ammo and ammo.Value < 3
+			for _, entry in ipairs(LOADOUT_GUNS) do
+				if killed then break end
+				-- Check deadline — exit early if taking too long
+				if tick() > loadoutDeadlineTime then
+					print("[loadout] exceeded 35s deadline, aborting")
+					return
 				end
-				if needsAmmo then
-					local ammoKey = gun.Name:sub(2, -2):lower() .. " ammo"
-					if shops[ammoKey] and local_cash >= shops[ammoKey][2] then
-						print("[loadout] buying ammo: " .. ammoKey)
-						buy(ammoKey, entry.ammoClips)
+
+				if not hasLoadoutGun(entry.nameMatch) then
+					if shops[entry.shopKey] and local_cash >= shops[entry.shopKey][2] then
+						print("[loadout] buying " .. entry.shopKey)
+						buy(entry.shopKey)
 						local t = 0
-						repeat task.wait(0.1); t += 0.1 until not purchasing or t > 12
+						-- Wait max 8s for purchase to complete, but exit if deadline approaches
+						repeat task.wait(0.1); t += 0.1
+						until (not purchasing and hasLoadoutGun(entry.nameMatch)) or t > 8 or tick() > loadoutDeadlineTime
+					else
+						print("[loadout] skip " .. entry.shopKey .. " — need $" ..
+							tostring(shops[entry.shopKey] and shops[entry.shopKey][2] or "?") ..
+							" have $" .. local_cash)
+					end
+				end
+
+				local gun = findLoadoutGun(entry.nameMatch)
+				if gun and gun.Parent == plr.Backpack then
+					equipGun(gun)
+					task.wait(0.2)
+				end
+
+				gun = findLoadoutGun(entry.nameMatch)
+				if gun and inventory then
+					local maxAmmoObj = gun:FindFirstChild("MaxAmmo")
+					local invSlot    = inventory:FindFirstChild(gun.Name)
+					local needsAmmo  = false
+					if maxAmmoObj and invSlot then
+						needsAmmo = math.floor(tonumber(invSlot.Value) / math.max(maxAmmoObj.Value, 1)) < 1
+					else
+						local ammo = gun:FindFirstChild("Ammo")
+						needsAmmo = ammo and ammo.Value < 3
+					end
+					if needsAmmo then
+						local ammoKey = gun.Name:sub(2, -2):lower() .. " ammo"
+						if shops[ammoKey] and local_cash >= shops[ammoKey][2] then
+							print("[loadout] buying ammo: " .. ammoKey)
+							buy(ammoKey, entry.ammoClips)
+							local t = 0
+							-- Wait max 12s for ammo purchase, but exit if deadline approaches
+							repeat task.wait(0.1); t += 0.1 until not purchasing or t > 12 or tick() > loadoutDeadlineTime
+						end
 					end
 				end
 			end
+		end)
+		if not ok then print("[loadout] error: " .. tostring(err)) end
+		loadoutBusy = false  -- always reset, even on error
+		loadoutDeadlineTime = 0
+	end)
+	-- Safety timeout to prevent permanent loadoutBusy (15s grace period after deadline)
+	task.delay(50, function()
+		if loadoutBusy then
+			print("[loadout] SAFETY: forcibly resetting loadoutBusy after 50s")
+			loadoutBusy = false
+			loadoutDeadlineTime = 0
 		end
-		loadoutBusy = false
 	end)
 end
 
@@ -1579,18 +1639,24 @@ do
 		local hrp = char and char:FindFirstChild("HumanoidRootPart")
 		if not hrp then return end
 		-- keep anchor welded to real hrp position via Heartbeat
-		rs.Heartbeat:Connect(function()
+		-- store connection so we can disconnect on next respawn
+		local conn = rs.Heartbeat:Connect(function()
 			if not in_void and not purchasing then
 				camAnchor.CFrame = hrp.CFrame
 			end
 		end)
+		return conn
 	end
 
-	if plr.Character then attachCamAnchor(plr.Character) end
-	plr.CharacterAdded:Connect(function(c)
+	local _camConn = nil
+	local function hookCam(char)
+		if _camConn then _camConn:Disconnect(); _camConn = nil end
 		task.wait(0.5)
-		attachCamAnchor(c)
-	end)
+		_camConn = attachCamAnchor(char)
+	end
+
+	if plr.Character then task.spawn(function() hookCam(plr.Character) end) end
+	plr.CharacterAdded:Connect(function(c) task.spawn(function() hookCam(c) end) end)
 
 	-- switch CameraSubject during teleports
 	rs.RenderStepped:Connect(function()
@@ -1737,8 +1803,9 @@ end)
 uis.InputBegan:Connect(function(input, gp)
 	if gp then return end
 	if input.KeyCode == Enum.KeyCode.P then
-		killed = true; targetPlayer = nil; stomping = false; in_void = false
+		killed = true; setTarget(nil); stomping = false; in_void = false
 		for p in pairs(espData) do clearESP(p) end
+		pcall(function() baitPart:Destroy() end)
 		local g = plr.PlayerGui:FindFirstChild("CombatGUI"); if g then g:Destroy() end
 		print("[combat] killed")
 	end
@@ -1767,10 +1834,10 @@ local function buildList()
 		row.MouseButton1Click:Connect(function()
 			if killed then return end
 			if targetPlayer == p then
-				targetPlayer=nil; stomping=false; in_void=false
+				setTarget(nil); stomping=false; in_void=false
 				showPopup("cleared", Color3.fromRGB(130,130,130))
 			else
-				targetPlayer=p; task.spawn(doLoadout)
+				setTarget(p); task.spawn(doLoadout)
 				showPopup(p.Name, WHITE)
 			end
 			buildList()
@@ -1781,7 +1848,7 @@ end
 
 refreshBtn.MouseButton1Click:Connect(function() buildShops(); buildList() end)
 stopBtn.MouseButton1Click:Connect(function()
-	targetPlayer=nil; stomping=false; in_void=false
+	setTarget(nil); stomping=false; in_void=false
 	showPopup("cleared", Color3.fromRGB(130,130,130))
 	buildList()
 end)
@@ -1789,7 +1856,7 @@ game.Players.PlayerAdded:Connect(function(p)
 	if not killed then initESP(p); buildList() end
 end)
 game.Players.PlayerRemoving:Connect(function(p)
-	if targetPlayer==p then targetPlayer=nil; stomping=false; in_void=false end
+	if targetPlayer==p then setTarget(nil); stomping=false; in_void=false end
 	clearESP(p)
 	if not killed then buildList() end
 end)
@@ -1809,10 +1876,10 @@ uis.InputBegan:Connect(function(input, gp)
 	end
 	if best then
 		if targetPlayer == best then
-			targetPlayer=nil; stomping=false; in_void=false
+			setTarget(nil); stomping=false; in_void=false
 			showPopup("cleared", Color3.fromRGB(130,130,130))
 		else
-			targetPlayer=best; task.spawn(doLoadout)
+			setTarget(best); task.spawn(doLoadout)
 			showPopup(best.Name, WHITE)
 		end
 		buildList()
@@ -1869,7 +1936,7 @@ task.spawn(function()
 	end
 
 	-- Lock on and go
-	targetPlayer = found
+	setTarget(found)
 	task.spawn(doLoadout)
 	buildList()
 	showPopup(found.Name, WHITE)
