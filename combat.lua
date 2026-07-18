@@ -17,7 +17,7 @@ local req  = (syn and syn.request) or request
 -- Change SERVER to match your deployment URL.
 -- When run standalone (manual execute), SCOUT_ID is used to check for an
 -- active assignment. If none found, falls back to the player-list GUI.
-local SERVER   = "https://sniper-zlqd.onrender.com"
+local SERVER   = "https://atlasbackend-lg1k.onrender.com"
 local SCOUT_ID = tostring(plr.UserId)
 
 -- ── BYPASS — full AC kill (3 methods) + report block ─────────
