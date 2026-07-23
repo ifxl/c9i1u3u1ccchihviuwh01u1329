@@ -16,6 +16,7 @@ local TARGET = nil
 local ACTIVE = false
 local UNLOADED = false
 local killed = false
+local lastAssignmentId = ""
 local myKnocked = false
 local local_cash = 0
 local local_armor = 0
@@ -90,7 +91,28 @@ local function hookKnocked(char)
 end
 
 if plr.Character then task.spawn(function() hookKnocked(plr.Character) end) end
-plr.CharacterAdded:Connect(function(c) task.spawn(function() hookKnocked(c) end) end)
+plr.CharacterAdded:Connect(function(c) 
+    task.spawn(function() hookKnocked(c) end)
+    killed = false
+    ACTIVE = false
+    TARGET = nil
+end)
+
+local lastJobId = ""
+rs.Heartbeat:Connect(function()
+    local currentJobId = game.JobId
+    if currentJobId ~= lastJobId and lastJobId ~= "" then
+        print("[auto-bag-combat] SERVER CHANGE DETECTED - clearing target")
+        lastJobId = currentJobId
+        TARGET = nil
+        ACTIVE = false
+        killed = false
+        inVoid = false
+        spawnProtectionState = "NONE"
+    elseif lastJobId == "" then
+        lastJobId = currentJobId
+    end
+end)
 
 local function hookDataFolder()
     task.spawn(function()
@@ -754,21 +776,26 @@ game.Players.PlayerRemoving:Connect(function(p)
 end)
 
 task.spawn(function()
+    task.wait(0.5)
+    
     local autoId = tostring(getgenv()._auto_target_id or "")
     local autoName = tostring(getgenv()._auto_target_name or "")
 
     if autoId == "" then
         local ok, res = pcall(function()
-            return req({ Url = SERVER .. "/api/assignment?accountId=" .. SCOUT_ID, Method = "GET" })
+            return req({ Url = SERVER .. "/api/assignment?accountId=" .. SCOUT_ID, Method = "GET", Timeout = 5 })
         end)
         if ok and res and res.Body then
             local ok2, d = pcall(function() return hs:JSONDecode(res.Body) end)
             if ok2 and d and d.assigned == true then
                 autoId = tostring(d.targetUserId or "")
                 autoName = tostring(d.targetUsername or "")
+                lastAssignmentId = autoId
                 print("[auto-bag-combat] assignment from server: " .. autoName .. " (" .. autoId .. ")")
             end
         end
+    else
+        lastAssignmentId = autoId
     end
 
     if autoId == "" then
@@ -798,12 +825,6 @@ task.spawn(function()
     ACTIVE = true
     killed = false
     
-    for _, b in ipairs(scroll:GetChildren()) do
-        if b:IsA("TextButton") then
-            b.BackgroundColor3 = b.Text == found.Name and Color3.fromRGB(45, 100, 180) or Color3.fromRGB(22, 22, 28)
-        end
-    end
-
     print("[auto-bag-combat] auto-targeting " .. found.Name)
 
     pcall(function()
